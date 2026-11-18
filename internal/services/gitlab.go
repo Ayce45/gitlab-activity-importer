@@ -47,39 +47,51 @@ func GetGitlabUser() (internal.GitLabUser, error) {
 
 func GetUsersProjectsIds(userId int) ([]int, error) {
 	url := os.Getenv("BASE_URL")
+	token := os.Getenv("GITLAB_TOKEN")
 
+	var projectIds []int
 	client := &http.Client{}
-	req, err := http.NewRequest("GET", fmt.Sprintf("%v/api/v4/users/%v/contributed_projects", url, userId), nil)
-	if err != nil {
-		return nil, fmt.Errorf("error creating the request: %v", err)
-	}
+	page := 1
 
-	req.Header.Set("PRIVATE-TOKEN", os.Getenv("GITLAB_TOKEN"))
-	res, err := client.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("error making the request: %v", err)
-	}
-	defer res.Body.Close()
+	for {
+		req, err := http.NewRequest("GET", fmt.Sprintf("%v/api/v4/projects?membership=true&simple=true&per_page=100&page=%d", url, page), nil)
+		if err != nil {
+			return nil, fmt.Errorf("error creating the request: %v", err)
+		}
 
-	if res.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("request failed with status code: %v", res.StatusCode)
-	}
+		req.Header.Set("PRIVATE-TOKEN", token)
+		res, err := client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("error making the request: %v", err)
+		}
 
-	body, err := io.ReadAll(res.Body)
-	if err != nil {
-		return nil, fmt.Errorf("error reading response: %w", err)
-	}
+		if res.StatusCode != http.StatusOK {
+			res.Body.Close()
+			return nil, fmt.Errorf("request failed with status code: %v", res.StatusCode)
+		}
 
-	var projects []struct {
-		ID int `json:"id"`
-	}
-	if err := json.Unmarshal(body, &projects); err != nil {
-		return nil, fmt.Errorf("error parsing JSON: %w", err)
-	}
+		body, err := io.ReadAll(res.Body)
+		res.Body.Close()
+		if err != nil {
+			return nil, fmt.Errorf("error reading response: %w", err)
+		}
 
-	projectIds := make([]int, len(projects))
-	for i, project := range projects {
-		projectIds[i] = project.ID
+		var projects []struct {
+			ID int `json:"id"`
+		}
+		if err := json.Unmarshal(body, &projects); err != nil {
+			return nil, fmt.Errorf("error parsing JSON: %w", err)
+		}
+
+		if len(projects) == 0 {
+			break
+		}
+
+		for _, project := range projects {
+			projectIds = append(projectIds, project.ID)
+		}
+
+		page++
 	}
 
 	return projectIds, nil
@@ -141,16 +153,18 @@ func GetProjectCommits(projectId int, userName string) ([]internal.Commit, error
 
 func FetchAllCommits(projectIds []int, commiterName string, commitChannel chan []internal.Commit) {
 	var wg sync.WaitGroup
+	sem := make(chan struct{}, 16)
 
 	for _, projectId := range projectIds {
 		wg.Add(1)
 
 		go func(projId int) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
 
 			commits, err := GetProjectCommits(projId, commiterName)
 			if err != nil {
-				log.Printf("Error fetching commits for project %d: %v", projId, err)
 				return
 			}
 			if len(commits) > 0 {
